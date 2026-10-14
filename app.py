@@ -2,6 +2,7 @@ import os
 import re
 import sqlite3
 import base64
+import whois
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
