@@ -8,13 +8,18 @@ from flask_cors import CORS
 app = Flask(__name__)
 
 frontend_origin = os.getenv("FRONTEND_ORIGIN", "")
-
-origins = [frontend_origin] if frontend_origin else [
-    "http://localhost:5500",
-    "http://127.0.0.1:5500"
-]
-
-CORS(app, resources={r"/api/*": {"origins": origins}})
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": [
+                "https://buchirajuavinash19-dotcom.github.io"
+            ],
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": ["Content-Type"]
+        }
+    }
+)
 
 DB_PATH = os.getenv("DB_PATH", "scans.db")
 
