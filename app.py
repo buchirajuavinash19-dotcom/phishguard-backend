@@ -1,4 +1,3 @@
-
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -8,9 +7,8 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 
-# Allow only your deployed frontend in production.
-# Set FRONTEND_ORIGIN in the hosting dashboard.
 frontend_origin = os.getenv("FRONTEND_ORIGIN", "")
+
 origins = [frontend_origin] if frontend_origin else [
     "http://localhost:5500",
     "http://127.0.0.1:5500"
@@ -55,14 +53,16 @@ def scan_url():
 
     url = url.strip()
 
-    # Basic demo check only; not a live threat database.
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    result = data.get("result", "Demo check only - not verified safe")
+    result = data.get(
+        "result",
+        "Demo check only - not verified safe"
+    )
 
-if result not in ("Safe", "Suspicious", "Phishing"):
-    result = "Demo check only - not verified safe"
+    if result not in ("Safe", "Suspicious", "Phishing"):
+        result = "Demo check only - not verified safe"
 
     checked_at = datetime.now(timezone.utc).isoformat()
 
@@ -86,6 +86,7 @@ if result not in ("Safe", "Suspicious", "Phishing"):
 def history():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
+
         rows = conn.execute("""
             SELECT id, url, result, checked_at
             FROM scan_history
@@ -93,7 +94,9 @@ def history():
             LIMIT 100
         """).fetchall()
 
-    return jsonify({"history": [dict(row) for row in rows]})
+    return jsonify({
+        "history": [dict(row) for row in rows]
+    })
 
 
 init_db()
