@@ -59,6 +59,9 @@ def scan_url():
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
+    result = data.get("result", "Demo check only - not verified safe")
+
+if result not in ("Safe", "Suspicious", "Phishing"):
     result = "Demo check only - not verified safe"
 
     checked_at = datetime.now(timezone.utc).isoformat()
