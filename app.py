@@ -2,8 +2,10 @@ import os
 import re
 import sqlite3
 import base64
+import ipaddress
 import whois
-from datetime import datetime, timezone
+
+from datetime import date, datetime, timezone
 from urllib.parse import urlparse
 
 import requests
@@ -56,8 +58,6 @@ def init_db():
             ).fetchall()
         }
 
-        # Add the score column to existing databases without
-        # deleting previously saved scan history.
         if "risk_score" not in columns:
             conn.execute(
                 "ALTER TABLE scan_history "
@@ -93,11 +93,14 @@ def normalize_url(value):
 def valid_url(url):
     try:
         parsed = urlparse(url)
+        host = parsed.hostname
 
         return (
             parsed.scheme in ("http", "https")
-            and bool(parsed.hostname)
+            and bool(host)
             and not any(c.isspace() for c in url)
+            and not any(ord(c) < 32 for c in url)
+            and len(host) <= 253
         )
     except (ValueError, TypeError):
         return False
@@ -131,9 +134,12 @@ def analyze_url(value):
             indicators.append("URL does not use HTTPS")
             score += 15
 
-        if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host):
+        try:
+            ipaddress.ip_address(host)
             indicators.append("URL uses an IP address")
             score += 30
+        except ValueError:
+            pass
 
         if "xn--" in host:
             indicators.append(
@@ -150,7 +156,10 @@ def analyze_url(value):
             "secure", "update", "wallet", "signin"
         )
 
-        found = [word for word in words if word in url.lower()]
+        found = [
+            word for word in words
+            if word in url.lower()
+        ]
 
         if found:
             indicators.append(
@@ -318,15 +327,12 @@ def full_url_scan(value):
     malicious = int(vt.get("malicious", 0) or 0)
     suspicious = int(vt.get("suspicious", 0) or 0)
 
-    # Google Safe Browsing threat match.
     if google.get("status") == "flagged":
         score = max(score, 85)
         indicators.append(
             "Google Safe Browsing reported a threat match"
         )
 
-    # VirusTotal results are signals, not absolute proof.
-    # A single detection must not automatically mean CRITICAL.
     if malicious >= 3:
         score = max(score, 75)
         indicators.append(
@@ -347,7 +353,6 @@ def full_url_scan(value):
 
     score = min(score, 100)
 
-    # Determine the result using both heuristics and live checks.
     if google.get("status") == "flagged" or malicious >= 3:
         result = "Phishing"
     elif score >= 15:
@@ -366,7 +371,6 @@ def full_url_scan(value):
     analysis["is_phishing"] = result == "Phishing"
     analysis["indicators"] = indicators
     analysis["result"] = result
-
     analysis["note"] = (
         "Live-check statuses are shown separately. "
         "A low-risk result does not guarantee safety. "
@@ -394,7 +398,10 @@ def analyze_email(email):
         "bank details"
     )
 
-    matches = [phrase for phrase in phrases if phrase in content]
+    matches = [
+        phrase for phrase in phrases
+        if phrase in content
+    ]
 
     if matches:
         indicators.append(
@@ -407,7 +414,9 @@ def analyze_email(email):
         indicators.append("Email body contains a URL to check")
         score += 15
 
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", sender):
+    if not re.fullmatch(
+        r"[^@\s]+@[^@\s]+\.[^@\s]+", sender
+    ):
         indicators.append("Sender address format appears invalid")
         score += 15
 
@@ -430,6 +439,91 @@ def analyze_email(email):
             "This does not prove the email is genuine."
         ]
     }
+
+
+# ---------------- WHOIS LOOKUP ----------------
+
+@app.post("/api/whois")
+def whois_lookup():
+    data = request.get_json(silent=True) or {}
+    value = data.get("domain", "")
+
+    if not isinstance(value, str) or not value.strip():
+        return jsonify({
+            "error": "Please enter a domain name."
+        }), 400
+
+    value = value.strip()
+
+    if not value.startswith(("http://", "https://")):
+        value = "https://" + value
+
+    try:
+        parsed = urlparse(value)
+        domain = (parsed.hostname or "").lower().rstrip(".")
+
+        if (
+            not domain
+            or "." not in domain
+            or len(domain) > 253
+            or any(
+                not label or len(label) > 63
+                for label in domain.split(".")
+            )
+            or any(
+                not re.fullmatch(
+                    r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?",
+                    label
+                )
+                for label in domain.split(".")
+            )
+        ):
+            return jsonify({
+                "error": "Enter a valid domain, such as example.com."
+            }), 400
+
+        try:
+            ipaddress.ip_address(domain)
+            return jsonify({
+                "error": "Please enter a domain name, not an IP address."
+            }), 400
+        except ValueError:
+            pass
+
+        info = whois.whois(domain)
+
+        def format_value(value):
+            if value is None:
+                return "Not available"
+
+            if isinstance(value, (datetime, date)):
+                return value.isoformat()
+
+            if isinstance(value, (list, set, tuple)):
+                return ", ".join(
+                    format_value(item) for item in value
+                )
+
+            return str(value)
+
+        return jsonify({
+            "domain": domain,
+            "registrar": format_value(info.registrar),
+            "creation_date": format_value(info.creation_date),
+            "expiration_date": format_value(info.expiration_date),
+            "updated_date": format_value(info.updated_date),
+            "name_servers": format_value(info.name_servers),
+            "status": format_value(info.status),
+            "emails": format_value(info.emails)
+        }), 200
+
+    except Exception:
+        return jsonify({
+            "error": (
+                "WHOIS lookup failed. The domain registry may be "
+                "unavailable or the domain may not provide this data."
+            )
+        }), 502
 
 
 # ---------------- API ROUTES ----------------
@@ -456,12 +550,16 @@ def scan_url():
     value = data.get("url", "")
 
     if not isinstance(value, str) or not value.strip():
-        return jsonify({"error": "Please enter a URL"}), 400
+        return jsonify({
+            "error": "Please enter a URL"
+        }), 400
 
     normalized = normalize_url(value)
 
     if not valid_url(normalized):
-        return jsonify({"error": "Please enter a valid URL"}), 400
+        return jsonify({
+            "error": "Please enter a valid URL"
+        }), 400
 
     analysis = full_url_scan(normalized)
 
@@ -564,6 +662,14 @@ def history():
     })
 
 
-# Create or migrate the database when the service starts.
+# ---------------- STARTUP ----------------
+
 init_db()
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 5000))
+    )
     
