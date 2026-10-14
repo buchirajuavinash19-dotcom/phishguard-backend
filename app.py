@@ -1,4 +1,3 @@
-
 import os
 import re
 import sqlite3
@@ -11,10 +10,11 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
-DB_PATH = os.getenv("DB_PATH", "scans.db")
 
+DB_PATH = os.getenv("DB_PATH", "scans.db")
 GOOGLE_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "")
 VT_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
+TIMEOUT = 12
 
 CORS(
     app,
@@ -29,8 +29,8 @@ CORS(
     }
 )
 
-TIMEOUT = 12
 
+# ---------------- DATABASE ----------------
 
 def now_utc():
     return datetime.now(timezone.utc).isoformat()
@@ -43,23 +43,56 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT NOT NULL,
                 result TEXT NOT NULL,
-                checked_at TEXT NOT NULL
+                checked_at TEXT NOT NULL,
+                risk_score INTEGER
             )
         """)
 
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(scan_history)"
+            ).fetchall()
+        }
+
+        # Add the score column to existing databases without
+        # deleting previously saved scan history.
+        if "risk_score" not in columns:
+            conn.execute(
+                "ALTER TABLE scan_history "
+                "ADD COLUMN risk_score INTEGER"
+            )
+
+
+def save_history(url, result, risk_score=None):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("""
+            INSERT INTO scan_history
+                (url, result, checked_at, risk_score)
+            VALUES (?, ?, ?, ?)
+        """, (url, result, now_utc(), risk_score))
+
+        return cursor.lastrowid
+
+
+# ---------------- URL VALIDATION ----------------
 
 def normalize_url(value):
     value = value.strip()
+
     if not value:
         return ""
+
     if not value.startswith(("http://", "https://")):
         value = "https://" + value
+
     return value
 
 
 def valid_url(url):
     try:
         parsed = urlparse(url)
+
         return (
             parsed.scheme in ("http", "https")
             and bool(parsed.hostname)
@@ -69,10 +102,23 @@ def valid_url(url):
         return False
 
 
+# ---------------- RISK ANALYSIS ----------------
+
+def risk_level(score):
+    if score >= 75:
+        return "CRITICAL"
+    if score >= 50:
+        return "HIGH"
+    if score >= 25:
+        return "MEDIUM"
+    return "LOW"
+
+
 def analyze_url(value):
     url = normalize_url(value)
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
+
     indicators = []
     score = 0
 
@@ -89,7 +135,9 @@ def analyze_url(value):
             score += 30
 
         if "xn--" in host:
-            indicators.append("Domain contains an internationalized label")
+            indicators.append(
+                "Domain contains an internationalized label"
+            )
             score += 25
 
         if "@" in url:
@@ -100,7 +148,9 @@ def analyze_url(value):
             "login", "verify", "account", "password",
             "secure", "update", "wallet", "signin"
         )
-        found = [w for w in words if w in url.lower()]
+
+        found = [word for word in words if word in url.lower()]
+
         if found:
             indicators.append(
                 "Potentially suspicious keywords: "
@@ -113,6 +163,7 @@ def analyze_url(value):
             score += 10
 
     score = min(score, 100)
+
     return {
         "type": "url",
         "input": url,
@@ -124,15 +175,7 @@ def analyze_url(value):
     }
 
 
-def risk_level(score):
-    if score >= 75:
-        return "CRITICAL"
-    if score >= 50:
-        return "HIGH"
-    if score >= 25:
-        return "MEDIUM"
-    return "LOW"
-
+# ---------------- GOOGLE SAFE BROWSING ----------------
 
 def google_check(url):
     if not GOOGLE_API_KEY:
@@ -178,8 +221,7 @@ def google_check(url):
                 "http_status": response.status_code
             }
 
-        data = response.json()
-        matches = data.get("matches", [])
+        matches = response.json().get("matches", [])
 
         return {
             "status": "flagged" if matches else "no_match",
@@ -192,9 +234,11 @@ def google_check(url):
             ]
         }
 
-    except requests.RequestException:
+    except (requests.RequestException, ValueError):
         return {"status": "unavailable"}
 
+
+# ---------------- VIRUSTOTAL ----------------
 
 def virustotal_check(url):
     if not VT_API_KEY:
@@ -231,26 +275,29 @@ def virustotal_check(url):
             .get("data", {})
             .get("attributes", {})
         )
+
         stats = attributes.get("last_analysis_stats", {})
-        malicious = int(stats.get("malicious", 0))
-        suspicious = int(stats.get("suspicious", 0))
+
+        malicious = int(stats.get("malicious", 0) or 0)
+        suspicious = int(stats.get("suspicious", 0) or 0)
 
         return {
             "status": (
-                "flagged" if malicious > 0 or suspicious > 0
+                "flagged"
+                if malicious > 0 or suspicious > 0
                 else "analyzed"
             ),
             "malicious": malicious,
             "suspicious": suspicious,
-            "harmless": int(stats.get("harmless", 0)),
-            "undetected": int(stats.get("undetected", 0))
+            "harmless": int(stats.get("harmless", 0) or 0),
+            "undetected": int(stats.get("undetected", 0) or 0)
         }
 
-    except requests.RequestException:
-        return {"status": "unavailable"}
-    except (ValueError, TypeError):
+    except (requests.RequestException, ValueError, TypeError):
         return {"status": "unavailable"}
 
+
+# ---------------- COMPLETE URL SCAN ----------------
 
 def full_url_scan(value):
     analysis = analyze_url(value)
@@ -267,42 +314,68 @@ def full_url_scan(value):
     indicators = analysis["indicators"][:]
     score = analysis["risk_score"]
 
+    malicious = int(vt.get("malicious", 0) or 0)
+    suspicious = int(vt.get("suspicious", 0) or 0)
+
+    # Google Safe Browsing threat match.
     if google.get("status") == "flagged":
         score = max(score, 85)
-        indicators.append("Google Safe Browsing flagged this URL")
+        indicators.append(
+            "Google Safe Browsing reported a threat match"
+        )
 
-    if vt.get("status") == "flagged":
-        if vt.get("malicious", 0) > 0:
-            score = max(score, 85)
-            indicators.append(
-                "VirusTotal reports malicious detections"
-            )
-        elif vt.get("suspicious", 0) > 0:
-            score = max(score, 60)
-            indicators.append(
-                "VirusTotal reports suspicious detections"
-            )
+    # VirusTotal results are signals, not absolute proof.
+    # A single detection must not automatically mean CRITICAL.
+    if malicious >= 3:
+        score = max(score, 75)
+        indicators.append(
+            f"VirusTotal reports {malicious} malicious detections"
+        )
+    elif malicious > 0:
+        score = max(score, 40)
+        indicators.append(
+            f"VirusTotal reports {malicious} malicious detection(s); "
+            "independent verification is recommended"
+        )
 
-    analysis["risk_score"] = min(score, 100)
-    analysis["risk_level"] = risk_level(analysis["risk_score"])
-    analysis["is_phishing"] = analysis["risk_score"] >= 50
-    analysis["indicators"] = indicators or [
-        "No suspicious indicators detected by the available checks; "
-        "this does not guarantee safety"
-    ]
+    if suspicious > 0:
+        score = max(score, 35)
+        indicators.append(
+            f"VirusTotal reports {suspicious} suspicious detection(s)"
+        )
 
-    if google.get("status") == "flagged" or vt.get("status") == "flagged":
+    score = min(score, 100)
+
+    # Determine the result using both heuristics and live checks.
+    if google.get("status") == "flagged" or malicious >= 3:
         result = "Phishing"
-    elif analysis["risk_score"] >= 50:
-        result = "Phishing"
-    elif analysis["risk_score"] >= 15:
+    elif score >= 15:
         result = "Suspicious"
     else:
         result = "Safe"
 
+    if not indicators:
+        indicators.append(
+            "No suspicious indicators found by available checks. "
+            "This does not guarantee the URL is safe."
+        )
+
+    analysis["risk_score"] = score
+    analysis["risk_level"] = risk_level(score)
+    analysis["is_phishing"] = result == "Phishing"
+    analysis["indicators"] = indicators
     analysis["result"] = result
+
+    analysis["note"] = (
+        "Live-check statuses are shown separately. "
+        "A low-risk result does not guarantee safety. "
+        "A VirusTotal detection count is a signal, not proof."
+    )
+
     return analysis
 
+
+# ---------------- BASIC EMAIL ANALYSIS ----------------
 
 def analyze_email(email):
     sender = str(email.get("sender", "unknown@example.com"))
@@ -319,7 +392,8 @@ def analyze_email(email):
         "claim your prize", "send your password",
         "bank details"
     )
-    matches = [p for p in phrases if p in content]
+
+    matches = [phrase for phrase in phrases if phrase in content]
 
     if matches:
         indicators.append(
@@ -337,6 +411,7 @@ def analyze_email(email):
         score += 15
 
     score = min(score, 100)
+
     return {
         "type": "email",
         "input": sender,
@@ -344,25 +419,25 @@ def analyze_email(email):
         "risk_score": score,
         "risk_level": risk_level(score),
         "is_phishing": score >= 50,
+        "result": (
+            "Phishing" if score >= 50
+            else "Suspicious" if score >= 15
+            else "Safe"
+        ),
         "indicators": indicators or [
-            "No basic suspicious indicators found; "
-            "this does not prove the email is genuine"
+            "No basic suspicious indicators found. "
+            "This does not prove the email is genuine."
         ]
     }
 
 
-def save_history(url, result):
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute("""
-            INSERT INTO scan_history (url, result, checked_at)
-            VALUES (?, ?, ?)
-        """, (url, result, now_utc()))
-        return cursor.lastrowid
-
+# ---------------- API ROUTES ----------------
 
 @app.get("/")
 def home():
-    return jsonify({"message": "PhishGuard AI Backend is running"})
+    return jsonify({
+        "message": "PhishGuard AI Backend is running"
+    })
 
 
 @app.get("/api/health")
@@ -382,17 +457,22 @@ def scan_url():
     if not isinstance(value, str) or not value.strip():
         return jsonify({"error": "Please enter a URL"}), 400
 
-    analysis = full_url_scan(value)
+    normalized = normalize_url(value)
+
+    if not valid_url(normalized):
+        return jsonify({"error": "Please enter a valid URL"}), 400
+
+    analysis = full_url_scan(normalized)
+
     record_id = save_history(
-        analysis["url"], analysis["result"]
+        analysis["url"],
+        analysis["result"],
+        analysis["risk_score"]
     )
 
     analysis["id"] = record_id
     analysis["checked_at"] = now_utc()
-    analysis["note"] = (
-        "Live check statuses are shown individually. "
-        "A low-risk result does not guarantee safety."
-    )
+
     return jsonify(analysis)
 
 
@@ -403,7 +483,9 @@ def scan_batch():
     emails = data.get("emails", [])
 
     if not isinstance(urls, list) or not isinstance(emails, list):
-        return jsonify({"error": "URLs and emails must be lists"}), 400
+        return jsonify({
+            "error": "URLs and emails must be lists"
+        }), 400
 
     if len(urls) + len(emails) == 0:
         return jsonify({
@@ -421,9 +503,30 @@ def scan_batch():
         if not isinstance(value, str) or not value.strip():
             continue
 
-        entry = full_url_scan(value)
+        normalized = normalize_url(value)
+
+        if not valid_url(normalized):
+            results.append({
+                "type": "url",
+                "input": value,
+                "url": value,
+                "result": "Invalid",
+                "risk_score": 0,
+                "risk_level": "UNKNOWN",
+                "indicators": ["Invalid URL format"]
+            })
+            continue
+
+        entry = full_url_scan(normalized)
+
+        record_id = save_history(
+            entry["url"],
+            entry["result"],
+            entry["risk_score"]
+        )
+
+        entry["id"] = record_id
         results.append(entry)
-        save_history(entry["url"], entry["result"])
 
     for email in emails:
         if isinstance(email, dict):
@@ -431,12 +534,14 @@ def scan_batch():
 
     return jsonify({
         "total": len(results),
-        "batch_id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+        "batch_id": datetime.now(timezone.utc).strftime(
+            "%Y%m%d%H%M%S"
+        ),
         "scanned_at": now_utc(),
         "results": results,
         "note": (
-            "Check each live_checks status. VirusTotal free API "
-            "rate limits may affect large batches."
+            "Live checks can be unavailable or rate-limited. "
+            "Review each result and its indicators."
         )
     })
 
@@ -445,15 +550,19 @@ def scan_batch():
 def history():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
+
         rows = conn.execute("""
-            SELECT id, url, result, checked_at
+            SELECT id, url, result, checked_at, risk_score
             FROM scan_history
             ORDER BY id DESC
             LIMIT 100
         """).fetchall()
 
-    return jsonify({"history": [dict(row) for row in rows]})
+    return jsonify({
+        "history": [dict(row) for row in rows]
+    })
 
 
+# Create or migrate the database when the service starts.
 init_db()
-            
+    
